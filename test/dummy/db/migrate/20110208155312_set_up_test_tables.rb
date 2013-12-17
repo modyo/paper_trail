@@ -29,6 +29,7 @@ class SetUpTestTables < ActiveRecord::Migration
       t.string :action
       t.string  :question
       t.integer :article_id
+      t.string :title
 
       # Controller info columns.
       t.string :ip
@@ -79,6 +80,7 @@ class SetUpTestTables < ActiveRecord::Migration
 
     create_table :people, :force => true do |t|
       t.string :name
+      t.string :time_zone
     end
 
     create_table :songs, :force => true do |t|

@@ -2,8 +2,7 @@ require 'bundler'
 Bundler::GemHelper.install_tasks
 
 require 'rake/testtask'
-
-desc 'Test the paper_trail plugin.'
+desc 'Run tests on PaperTrail with Test::Unit.'
 Rake::TestTask.new(:test) do |t|
   t.libs << 'lib'
   t.libs << 'test'
@@ -11,5 +10,9 @@ Rake::TestTask.new(:test) do |t|
   t.verbose = false
 end
 
-desc 'Default: run unit tests.'
-task :default => :test
+require 'rspec/core/rake_task'
+desc 'Run PaperTrail specs for the RSpec helper.'
+RSpec::Core::RakeTask.new(:spec)
+
+desc 'Default: run all available test suites'
+task :default => [:test, :spec]

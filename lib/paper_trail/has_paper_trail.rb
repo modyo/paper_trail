@@ -5,7 +5,6 @@ module PaperTrail
       base.send :extend, ClassMethods
     end
 
-
     module ClassMethods
       # Declare this in your model to track every create, update, and destroy.  Each version of
       # the model is available in the `versions` association.
@@ -13,10 +12,14 @@ module PaperTrail
       # Options:
       # :on           the events to track (optional; defaults to all of them).  Set to an array of
       #               `:create`, `:update`, `:destroy` as desired.
-      # :class_name   the name of a custom Version class.  This class should inherit from Version.
+      # :class_name   the name of a custom Version class.  This class should inherit from `PaperTrail::Version`.
       # :ignore       an array of attributes for which a new `Version` will not be created if only they change.
+      #               it can also aceept a Hash as an argument where the key is the attribute to ignore (a `String` or `Symbol`), 
+      #               which will only be ignored if the value is a `Proc` which returns truthily.
       # :if, :unless  Procs that allow to specify conditions when to save versions for an object
       # :only         inverse of `ignore` - a new `Version` will be created only for these attributes if supplied
+      #               it can also aceept a Hash as an argument where the key is the attribute to track (a `String` or `Symbol`), 
+      #               which will only be counted if the value is a `Proc` which returns truthily.
       # :skip         fields to ignore completely.  As with `ignore`, updates to these fields will not create
       #               a new `Version`.  In addition, these fields will not be included in the serialized versions
       #               of the object whenever a new `Version` is created.
@@ -39,25 +42,17 @@ module PaperTrail
         attr_accessor self.version_association_name
 
         class_attribute :version_class_name
-        self.version_class_name = options[:class_name] || 'Version'
+        self.version_class_name = options[:class_name] || 'PaperTrail::Version'
 
-        class_attribute :ignore
-        self.ignore = ([options[:ignore]].flatten.compact || []).map &:to_s
+        class_attribute :paper_trail_options
+        self.paper_trail_options = options.dup
 
-        class_attribute :if_condition
-        self.if_condition = options[:if]
+        [:ignore, :skip, :only].each do |k|
+          paper_trail_options[k] =
+            [paper_trail_options[k]].flatten.compact.map { |attr| attr.is_a?(Hash) ? attr.stringify_keys : attr.to_s }
+        end
 
-        class_attribute :unless_condition
-        self.unless_condition = options[:unless]
-
-        class_attribute :skip
-        self.skip = ([options[:skip]].flatten.compact || []).map &:to_s
-
-        class_attribute :only
-        self.only = ([options[:only]].flatten.compact || []).map &:to_s
-
-        class_attribute :meta
-        self.meta = options[:meta] || {}
+        paper_trail_options[:meta] ||= {}
 
         class_attribute :paper_trail_enabled_for_model
         self.paper_trail_enabled_for_model = true
@@ -65,14 +60,23 @@ module PaperTrail
         class_attribute :versions_association_name
         self.versions_association_name = options[:versions] || :versions
 
-        has_many self.versions_association_name,
-                 :class_name => version_class_name,
-                 :as         => :item,
-                 :order      => "#{PaperTrail.timestamp_field} ASC, #{self.version_class_name.constantize.primary_key} ASC"
+        attr_accessor :paper_trail_event
 
-        after_create  :record_create, :if => :save_version? if !options[:on] || options[:on].include?(:create)
-        before_update :record_update, :if => :save_version? if !options[:on] || options[:on].include?(:update)
-        after_destroy :record_destroy if !options[:on] || options[:on].include?(:destroy)
+        if ::ActiveRecord::VERSION::STRING.to_f >= 4.0 # `has_many` syntax for specifying order uses a lambda in Rails 4
+          has_many self.versions_association_name,
+            lambda { order("#{PaperTrail.timestamp_field} ASC") },
+            :class_name => self.version_class_name, :as => :item
+        else
+          has_many self.versions_association_name,
+            :class_name => self.version_class_name,
+            :as         => :item,
+            :order      => "#{PaperTrail.timestamp_field} ASC"
+        end
+
+        options_on = Array(options[:on]) # so that a single symbol can be passed in without wrapping it in an `Array`
+        after_create  :record_create, :if => :save_version? if options_on.empty? || options_on.include?(:create)
+        before_update :record_update, :if => :save_version? if options_on.empty? || options_on.include?(:update)
+        after_destroy :record_destroy, :if => :save_version? if options_on.empty? || options_on.include?(:destroy)
       end
 
       # Switches PaperTrail off for this class.
@@ -84,6 +88,64 @@ module PaperTrail
       def paper_trail_on
         self.paper_trail_enabled_for_model = true
       end
+
+      def paper_trail_version_class
+        @paper_trail_version_class ||= version_class_name.constantize
+      end
+
+      # Used for Version#object attribute
+      def serialize_attributes_for_paper_trail(attributes)
+        # don't serialize before values before inserting into columns of type `JSON` on `PostgreSQL` databases
+        return attributes if self.paper_trail_version_class.object_col_is_json?
+
+        serialized_attributes.each do |key, coder|
+          if attributes.key?(key)
+            coder = PaperTrail::Serializers::YAML unless coder.respond_to?(:dump) # Fall back to YAML if `coder` has no `dump` method
+            attributes[key] = coder.dump(attributes[key])
+          end
+        end
+      end
+
+      def unserialize_attributes_for_paper_trail(attributes)
+        # don't serialize before values before inserting into columns of type `JSON` on `PostgreSQL` databases
+        return attributes if self.paper_trail_version_class.object_col_is_json?
+
+        serialized_attributes.each do |key, coder|
+          if attributes.key?(key)
+            coder = PaperTrail::Serializers::YAML unless coder.respond_to?(:dump)
+            attributes[key] = coder.load(attributes[key])
+          end
+        end
+      end
+
+      # Used for Version#object_changes attribute
+      def serialize_attribute_changes(changes)
+        # don't serialize before values before inserting into columns of type `JSON` on `PostgreSQL` databases
+        return changes if self.paper_trail_version_class.object_changes_col_is_json?
+
+        serialized_attributes.each do |key, coder|
+          if changes.key?(key)
+            coder = PaperTrail::Serializers::YAML unless coder.respond_to?(:dump) # Fall back to YAML if `coder` has no `dump` method
+            old_value, new_value = changes[key]
+            changes[key] = [coder.dump(old_value),
+                            coder.dump(new_value)]
+          end
+        end
+      end
+
+      def unserialize_attribute_changes(changes)
+        # don't serialize before values before inserting into columns of type `JSON` on `PostgreSQL` databases
+        return changes if self.paper_trail_version_class.object_changes_col_is_json?
+
+        serialized_attributes.each do |key, coder|
+          if changes.key?(key)
+            coder = PaperTrail::Serializers::YAML unless coder.respond_to?(:dump)
+            old_value, new_value = changes[key]
+            changes[key] = [coder.load(old_value),
+                            coder.load(new_value)]
+          end
+        end
+      end
     end
 
     # Wrap the following methods in a module so we can include them only in the
@@ -92,19 +154,19 @@ module PaperTrail
       # Returns true if this instance is the current, live one;
       # returns false if this instance came from a previous version.
       def live?
-        source_version.nil?
+        @is_live ||= source_version.nil?
       end
 
       # Returns who put the object into its current state.
       def originator
-        version_class.with_item_keys(self.class.name, id).last.try :whodunnit
+        @originator ||= self.class.paper_trail_version_class.with_item_keys(self.class.base_class.name, id).last.try :whodunnit
       end
 
       # Returns the object (not a Version) as it was at the given timestamp.
       def version_at(timestamp, reify_options={})
         # Because a version stores how its object looked *before* the change,
         # we need to look for the first version created *after* the timestamp.
-        v = send(self.class.versions_association_name).following(timestamp).first
+        v = send(self.class.versions_association_name).subsequent(timestamp).first
         v ? v.reify(reify_options) : self
       end
 
@@ -117,15 +179,17 @@ module PaperTrail
       # Returns the object (not a Version) as it was most recently.
       def previous_version
         preceding_version = source_version ? source_version.previous : send(self.class.versions_association_name).last
-        preceding_version.try :reify
+        preceding_version.reify if preceding_version
       end
 
       # Returns the object (not a Version) as it became next.
+      # NOTE: if self (the item) was not reified from a version, i.e. it is the
+      #  "live" item, we return nil.  Perhaps we should return self instead?
       def next_version
-        # NOTE: if self (the item) was not reified from a version, i.e. it is the
-        # "live" item, we return nil.  Perhaps we should return self instead?
-        subsequent_version = source_version ? source_version.next : nil
-        subsequent_version.reify if subsequent_version
+        subsequent_version = source_version.next
+        subsequent_version ? subsequent_version.reify : self.class.find(self.id)
+      rescue
+        nil
       end
 
       # Executes the given method or block without creating a new version.
@@ -139,56 +203,75 @@ module PaperTrail
 
       private
 
-      def version_class
-        version_class_name.constantize
-      end
-
       def source_version
         send self.class.version_association_name
       end
 
       def record_create
-        if switched_on?
-          send(self.class.versions_association_name).create merge_metadata(:event => 'create', :whodunnit => PaperTrail.whodunnit)
+        if paper_trail_switched_on?
+          data = {
+            :event     => paper_trail_event || 'create',
+            :whodunnit => PaperTrail.whodunnit
+          }
+
+          if changed_notably? and self.class.paper_trail_version_class.column_names.include?('object_changes')
+            data[:object_changes] = self.class.paper_trail_version_class.object_changes_col_is_json? ? changes_for_paper_trail :
+              PaperTrail.serializer.dump(changes_for_paper_trail)
+          end
+          send(self.class.versions_association_name).create! merge_metadata(data)
         end
       end
 
       def record_update
-        if switched_on? && changed_notably?
+        if paper_trail_switched_on? && changed_notably?
+          object_attrs = object_attrs_for_paper_trail(item_before_change)
           data = {
-            :event     => 'update',
-            :object    => object_to_string(item_before_change),
+            :event     => paper_trail_event || 'update',
+            :object    => self.class.paper_trail_version_class.object_col_is_json? ? object_attrs : PaperTrail.serializer.dump(object_attrs),
             :whodunnit => PaperTrail.whodunnit
           }
-          if version_class.column_names.include? 'object_changes'
-            # The double negative (reject, !include?) preserves the hash structure of self.changes.
-            data[:object_changes] = self.changes.reject do |key, value|
-              !notably_changed.include?(key)
-            end.to_yaml
+          if self.class.paper_trail_version_class.column_names.include?('object_changes')
+            data[:object_changes] = self.class.paper_trail_version_class.object_changes_col_is_json? ? changes_for_paper_trail :
+              PaperTrail.serializer.dump(changes_for_paper_trail)
           end
           send(self.class.versions_association_name).build merge_metadata(data)
         end
       end
 
+      def changes_for_paper_trail
+        self.changes.delete_if do |key, value|
+          !notably_changed.include?(key)
+        end.tap { |changes| self.class.serialize_attribute_changes(changes) }
+      end
+
       def record_destroy
-        if switched_on? and not new_record?
-          version_class.create merge_metadata(:item_id   => self.id,
-                                              :item_type => self.class.base_class.name,
-                                              :event     => 'destroy',
-                                              :object    => object_to_string(item_before_change),
-                                              :whodunnit => PaperTrail.whodunnit)
+        if paper_trail_switched_on? and not new_record?
+          object_attrs = object_attrs_for_paper_trail(item_before_change)
+          data = {
+            :item_id   => self.id,
+            :item_type => self.class.base_class.name,
+            :event     => paper_trail_event || 'destroy',
+            :object    => self.class.paper_trail_version_class.object_col_is_json? ? object_attrs : PaperTrail.serializer.dump(object_attrs),
+            :whodunnit => PaperTrail.whodunnit
+          }
+          self.class.paper_trail_version_class.create merge_metadata(data)
+          send(self.class.versions_association_name).send :load_target
         end
-        send(self.class.versions_association_name).send :load_target
       end
 
       def merge_metadata(data)
         # First we merge the model-level metadata in `meta`.
-        meta.each do |k,v|
+        paper_trail_options[:meta].each do |k,v|
           data[k] =
             if v.respond_to?(:call)
               v.call(self)
             elsif v.is_a?(Symbol) && respond_to?(v)
-              send(v)
+              # if it is an attribute that is changing, be sure to grab the current version
+              if has_attribute?(v) && send("#{v}_changed?".to_sym)
+                send("#{v}_was".to_sym)
+              else
+                send(v)
+              end
             else
               v
             end
@@ -201,16 +284,19 @@ module PaperTrail
         previous = self.dup
         # `dup` clears timestamps so we add them back.
         all_timestamp_attributes.each do |column|
-          previous[column] = send(column) if respond_to?(column) && !send(column).nil?
+          previous[column] = send(column) if self.class.column_names.include?(column.to_s) and not send(column).nil?
         end
         previous.tap do |prev|
-          prev.id = id
-          changed_attributes.each { |attr, before| prev[attr] = before }
+          prev.id = id # `dup` clears the `id` so we add that back
+          changed_attributes.select { |k,v| self.class.column_names.include?(k) }.each { |attr, before| prev[attr] = before }
         end
       end
 
-      def object_to_string(object)
-        object.attributes.except(*self.class.skip).to_yaml
+      # returns hash of object attributes (with appropriate attributes serialized), ommitting attributes to be skipped
+      def object_attrs_for_paper_trail(object)
+        _attrs = object.attributes.except(*self.paper_trail_options[:skip]).tap do |attributes|
+          self.class.serialize_attributes_for_paper_trail(attributes)
+        end
       end
 
       def changed_notably?
@@ -218,18 +304,31 @@ module PaperTrail
       end
 
       def notably_changed
-        self.class.only.empty? ? changed_and_not_ignored : (changed_and_not_ignored & self.class.only)
+        only = self.paper_trail_options[:only].dup
+        # remove Hash arguments and then evaluate whether the attributes (the keys of the hash) should also get pushed into the collection
+        only.delete_if do |obj|
+          obj.is_a?(Hash) && obj.each { |attr, condition| only << attr if condition.respond_to?(:call) && condition.call(self) }
+        end
+        only.empty? ? changed_and_not_ignored : (changed_and_not_ignored & only)
       end
 
       def changed_and_not_ignored
-        changed - self.class.ignore - self.class.skip
+        ignore = self.paper_trail_options[:ignore].dup
+         # remove Hash arguments and then evaluate whether the attributes (the keys of the hash) should also get pushed into the collection
+        ignore.delete_if do |obj|
+          obj.is_a?(Hash) && obj.each { |attr, condition| ignore << attr if condition.respond_to?(:call) && condition.call(self) }
+        end
+        skip = self.paper_trail_options[:skip]
+        changed - ignore - skip
       end
 
-      def switched_on?
-        PaperTrail.enabled? && PaperTrail.enabled_for_controller? && self.class.paper_trail_enabled_for_model
+      def paper_trail_switched_on?
+        PaperTrail.enabled? && PaperTrail.enabled_for_controller? && self.paper_trail_enabled_for_model
       end
 
       def save_version?
+        if_condition     = self.paper_trail_options[:if]
+        unless_condition = self.paper_trail_options[:unless]
         (if_condition.blank? || if_condition.call(self)) && !unless_condition.try(:call, self)
       end
     end
